@@ -19,23 +19,22 @@ CHECKOUT_READY_SELECTOR = os.getenv("CHECKOUT_READY_SELECTOR", "[data-checkout-r
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS", "20000"))
 SPINNER_TIMEOUT = int(os.getenv("SPINNER_TIMEOUT_MS", "15000"))
 HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
+RUN_INTERVAL = int(os.getenv("RUN_INTERVAL_MINUTES", "5"))  # Run every 5 minutes by default
 
 ALERT_WEBHOOK_URL = "https://n8n.primopromotions.com/webhook/alert"
 
-def alert_pricing_failure(msg: str, url: str = None, error_type: str = None):
-    """Only send alerts for pricing validation failures"""
-    print(msg, file=sys.stderr)
-    
+def send_results(results: dict):
+    """Send monitoring results to webhook on every run"""
     try:
         payload = {
-            "message": msg,
             "timestamp": datetime.utcnow().isoformat(),
-            "url": url,
-            "error_type": error_type or "pricing_validation_error"
+            "results": results,
+            "status": "success" if results.get("ok") else "failure"
         }
         requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
-    except Exception:
-        pass
+        print(f"Results sent to webhook: {results.get('status', 'unknown')}")
+    except Exception as e:
+        print(f"Failed to send results to webhook: {e}", file=sys.stderr)
 
 def wait_for_spinner_to_clear(page):
     try:
@@ -93,8 +92,6 @@ def ensure_checkout_ready(page):
     price = validate_pricing(page)
     if price <= 1.0:  # Price must be greater than $1
         error_msg = f"Pricing validation failed: Found price ${price:.2f} (must be > $1.00)"
-        alert_pricing_failure(f"[BSU Checkout Monitor] {datetime.utcnow().isoformat()} UTC ❌ {page.url}\nReason: {error_msg}", 
-                            url=page.url, error_type="pricing_validation_error")
         raise AssertionError(error_msg)
 
 def cart_text(page) -> str:
@@ -144,21 +141,73 @@ def check_flow(browser, start_url: str):
 
 def main():
     results = []
+    errors = []
+    overall_status = True
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS_MODE, args=["--no-sandbox"])
         for url in START_URLS:
             try:
                 res = check_flow(browser, url)
                 results.append(res)
+                print(f"✅ {url} - Success")
             except Exception as e:
                 ts = datetime.utcnow().isoformat()
                 err = "".join(traceback.format_exception_only(type(e), e)).strip()
-                # Only alert on pricing failures - other errors are logged but don't trigger webhooks
-                print(f"[BSU Checkout Monitor] {ts} UTC ❌ {url}\nReason: {err}", file=sys.stderr)
-                browser.close()
-                sys.exit(2)
+                error_info = {
+                    "url": url,
+                    "error": err,
+                    "timestamp": ts
+                }
+                errors.append(error_info)
+                overall_status = False
+                print(f"❌ {url} - {err}", file=sys.stderr)
         browser.close()
-    print(json.dumps({"ok": True, "results": results}, indent=2))
+    
+    # Prepare final results
+    final_results = {
+        "ok": overall_status,
+        "timestamp": datetime.utcnow().isoformat(),
+        "successful_checks": results,
+        "errors": errors,
+        "total_urls": len(START_URLS),
+        "successful_count": len(results),
+        "error_count": len(errors)
+    }
+    
+    # Always send results to webhook
+    send_results(final_results)
+    
+    # Print results locally
+    print(json.dumps(final_results, indent=2))
+    
+    # Exit with error code if there were failures
+    if not overall_status:
+        sys.exit(2)
+
+def run_continuously():
+    """Run the checker continuously at specified intervals"""
+    print(f"Starting BSU Checkout Monitor - running every {RUN_INTERVAL} minutes")
+    
+    while True:
+        try:
+            print(f"\n=== Running check at {datetime.utcnow().isoformat()} UTC ===")
+            main()
+            print(f"Check completed. Next run in {RUN_INTERVAL} minutes.")
+        except KeyboardInterrupt:
+            print("\nShutting down monitor...")
+            break
+        except Exception as e:
+            print(f"Unexpected error in monitor loop: {e}", file=sys.stderr)
+        
+        # Wait for the specified interval
+        time.sleep(RUN_INTERVAL * 60)
 
 if __name__ == "__main__":
-    main()
+    # Check if we should run once or continuously
+    run_once = os.getenv("RUN_ONCE", "false").lower() == "true"
+    
+    if run_once:
+        main()
+    else:
+        run_continuously()

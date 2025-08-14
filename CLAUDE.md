@@ -28,12 +28,16 @@ The system is heavily driven by environment variables:
 - `CART_CONTAINER_SELECTOR` - Selector for cart content area
 - `CHECKOUT_READY_SELECTOR` - Selector indicating checkout page is ready
 - `PAGE_TIMEOUT_MS` / `SPINNER_TIMEOUT_MS` - Timeout configurations
-- `SLACK_WEBHOOK_URL` / `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` - Alert configurations
+- `RUN_INTERVAL_MINUTES` / `RUN_ONCE` - Scheduling configurations
 
 ## Running the Application
 
 **Local execution:**
 ```bash
+# Run once
+RUN_ONCE=true python checker.py
+
+# Run continuously (every 5 minutes)
 python checker.py
 ```
 
@@ -43,7 +47,11 @@ docker build -t bsu-monitor .
 docker run bsu-monitor
 ```
 
-The script exits with code 2 on failures and sends alerts to configured notification channels.
+**Environment Variables:**
+- `RUN_INTERVAL_MINUTES` - Interval between checks (default: 5)
+- `RUN_ONCE` - Set to "true" to run once instead of continuously
+
+The script runs continuously by default, checking every 5 minutes and sending results to the webhook on every run regardless of success or failure.
 
 ## Key Flow Logic
 
