@@ -1,4 +1,4 @@
-import os, sys, time, json, traceback
+import os, sys, time, json, traceback, re
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 import requests
@@ -20,40 +20,22 @@ PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS", "20000"))
 SPINNER_TIMEOUT = int(os.getenv("SPINNER_TIMEOUT_MS", "15000"))
 HEADLESS_MODE = os.getenv("HEADLESS", "true").lower() == "true"
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-N8N_WEBHOOK_URL = "https://n8n.primopromotions.com/webhook/alert"
+ALERT_WEBHOOK_URL = "https://n8n.primopromotions.com/webhook/alert"
 
-def alert(msg: str, url: str = None, error_type: str = None):
+def alert_pricing_failure(msg: str, url: str = None, error_type: str = None):
+    """Only send alerts for pricing validation failures"""
     print(msg, file=sys.stderr)
     
-    # Send to n8n webhook
     try:
         payload = {
             "message": msg,
             "timestamp": datetime.utcnow().isoformat(),
             "url": url,
-            "error_type": error_type or "checkout_monitor_error"
+            "error_type": error_type or "pricing_validation_error"
         }
-        requests.post(N8N_WEBHOOK_URL, json=payload, timeout=10)
+        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=10)
     except Exception:
         pass
-    
-    if SLACK_WEBHOOK_URL:
-        try:
-            requests.post(SLACK_WEBHOOK_URL, json={"text": msg}, timeout=10)
-        except Exception:
-            pass
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10
-            )
-        except Exception:
-            pass
 
 def wait_for_spinner_to_clear(page):
     try:
@@ -63,6 +45,35 @@ def wait_for_spinner_to_clear(page):
     except PwTimeout:
         raise AssertionError("Spinner/loader never cleared")
 
+def validate_pricing(page) -> float:
+    """Extract and validate pricing from checkout page. Returns price as float."""
+    page_content = page.content()
+    
+    # Look for price patterns like $29.99, $49.95, etc.
+    price_patterns = [
+        r'\$\s*(\d+(?:\.\d{2})?)',  # $29.99, $ 29.99
+        r'price["\s]*:?["\s]*\$?\s*(\d+(?:\.\d{2})?)',  # price: $29.99
+        r'total["\s]*:?["\s]*\$?\s*(\d+(?:\.\d{2})?)',  # total: $29.99
+        r'amount["\s]*:?["\s]*\$?\s*(\d+(?:\.\d{2})?)',  # amount: $29.99
+    ]
+    
+    found_prices = []
+    for pattern in price_patterns:
+        matches = re.findall(pattern, page_content, re.IGNORECASE)
+        for match in matches:
+            try:
+                price = float(match)
+                if price > 0:  # Only consider positive prices
+                    found_prices.append(price)
+            except ValueError:
+                continue
+    
+    if not found_prices:
+        return 0.0
+    
+    # Return the highest price found (likely the total)
+    return max(found_prices)
+
 def ensure_checkout_ready(page):
     from urllib.parse import urlparse
     parsed_url = urlparse(page.url)
@@ -71,15 +82,20 @@ def ensure_checkout_ready(page):
         raise AssertionError(f"Unexpected checkout path: {page.url} (path: {path})")
     wait_for_spinner_to_clear(page)
     
-    # Instead of looking for specific selectors, just ensure we have forms and pricing content
+    # Check for form elements
     page_content = page.content().lower()
     has_form = 'form' in page_content or 'input' in page_content
-    has_pricing = any(term in page_content for term in ['$', 'price', 'total', 'amount', 'cost'])
     
     if not has_form:
         raise AssertionError("No form elements found on checkout page")
-    if not has_pricing:
-        raise AssertionError("No pricing information found on checkout page")
+    
+    # Validate pricing - this is the critical check
+    price = validate_pricing(page)
+    if price <= 1.0:  # Price must be greater than $1
+        error_msg = f"Pricing validation failed: Found price ${price:.2f} (must be > $1.00)"
+        alert_pricing_failure(f"[BSU Checkout Monitor] {datetime.utcnow().isoformat()} UTC ❌ {page.url}\nReason: {error_msg}", 
+                            url=page.url, error_type="pricing_validation_error")
+        raise AssertionError(error_msg)
 
 def cart_text(page) -> str:
     try:
@@ -137,7 +153,8 @@ def main():
             except Exception as e:
                 ts = datetime.utcnow().isoformat()
                 err = "".join(traceback.format_exception_only(type(e), e)).strip()
-                alert(f"[BSU Checkout Monitor] {ts} UTC ❌ {url}\nReason: {err}", url=url, error_type="checkout_flow_error")
+                # Only alert on pricing failures - other errors are logged but don't trigger webhooks
+                print(f"[BSU Checkout Monitor] {ts} UTC ❌ {url}\nReason: {err}", file=sys.stderr)
                 browser.close()
                 sys.exit(2)
         browser.close()
