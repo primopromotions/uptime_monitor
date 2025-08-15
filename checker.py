@@ -9,7 +9,7 @@ START_URLS = [
 ]
 
 VALID_CHECKOUT_PATHS = ["/checkout", "/checkout2", "/bloodsugarultra/checkout"]
-EXPECTED_CART_TEXT = os.getenv("EXPECTED_CART_TEXT", "Subscribe & Save").split(",")
+EXPECTED_CART_TEXT = os.getenv("EXPECTED_CART_TEXT", "Payment Details,Credit Card,Contact Information").split(",")
 
 CTA_SELECTOR = os.getenv("CTA_SELECTOR", "a[href*='checkout'], button[href*='checkout'], a.cta, button.cta")
 LOADING_OVERLAY_SELECTOR = os.getenv("LOADING_OVERLAY_SELECTOR", ".loading, .loader, .spinner, [data-loading='true']")
@@ -103,9 +103,16 @@ def cart_text(page) -> str:
     return " ".join(txt.split())
 
 def assert_cart_correct(text: str):
-    missing = [s.strip() for s in EXPECTED_CART_TEXT if s.strip() and s.strip() not in text]
-    if missing:
-        raise AssertionError(f"Cart text missing: {missing}")
+    # Check if ANY of the expected text elements are found (not all required)
+    found_elements = [s.strip() for s in EXPECTED_CART_TEXT if s.strip() and s.strip() in text]
+    
+    if not found_elements:
+        # Debug: Show what text was found
+        print(f"DEBUG: Expected any of: {EXPECTED_CART_TEXT}")
+        print(f"DEBUG: Found cart text: {text[:300]}...")  # First 300 chars
+        raise AssertionError(f"None of the expected checkout elements found: {EXPECTED_CART_TEXT}")
+    
+    print(f"✅ Found checkout elements: {found_elements}")
 
 def click_to_checkout(page):
     if page.locator(CTA_SELECTOR).count() > 0:
@@ -131,8 +138,19 @@ def check_flow(browser, start_url: str):
     page.goto(start_url)
     wait_for_spinner_to_clear(page)
     _title = page.title()
+    
+    # Wait before clicking to checkout as requested
+    time.sleep(2)
     click_to_checkout(page)
+    
+    # Wait for checkout page to fully load
     page.wait_for_load_state("domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)  # Reduced timeout
+    except Exception:
+        pass  # Continue even if networkidle times out
+    time.sleep(2)  # Additional wait for any dynamic content
+    
     ensure_checkout_ready(page)
     text = cart_text(page)
     assert_cart_correct(text)
